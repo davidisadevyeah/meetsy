@@ -1,75 +1,193 @@
-const http=require("http");
-const fs=require("fs");
-const path=require("path");
-const WebSocket=require("ws");
+const http = require("http");
+const fs = require("fs");
+const path = require("path");
+const WebSocket = require("ws");
 
-const PORT=process.env.PORT||3000;
-const PUBLIC=path.join(__dirname,"public");
-const MIME={".html":"text/html; charset=utf-8",".js":"text/javascript; charset=utf-8",".css":"text/css"};
+const PORT = process.env.PORT || 3000;
+const PUBLIC = path.join(__dirname, "public");
 
-const server=http.createServer((req,res)=>{
-  let u=(req.url||"/").split("?")[0];
-  if(u==="/")u="/index.html";
-  const file=path.normalize(path.join(PUBLIC,u));
-  if(!file.startsWith(PUBLIC))return res.writeHead(403).end();
-  fs.readFile(file,(err,data)=>{
-    if(err)return res.writeHead(404).end("Not found");
-    res.writeHead(200,{"Content-Type":MIME[path.extname(file)]||"application/octet-stream","Cache-Control":"no-store"});
+const MIME = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".svg": "image/svg+xml",
+  ".ico": "image/x-icon"
+};
+
+const server = http.createServer((req, res) => {
+  let urlPath = decodeURIComponent(req.url.split("?")[0]);
+
+  if (urlPath === "/") {
+    urlPath = "/index.html";
+  }
+
+  const filePath = path.join(PUBLIC, urlPath);
+
+  if (!filePath.startsWith(PUBLIC)) {
+    res.writeHead(403);
+    return res.end("Forbidden");
+  }
+
+  fs.readFile(filePath, (err, data) => {
+    if (err) {
+      res.writeHead(404);
+      return res.end("Not Found");
+    }
+
+    const ext = path.extname(filePath).toLowerCase();
+
+    res.writeHead(200, {
+      "Content-Type": MIME[ext] || "application/octet-stream",
+      "Cache-Control": "no-cache"
+    });
+
     res.end(data);
   });
 });
 
-const wss=new WebSocket.Server({server});
-const rooms=new Map();
+const wss = new WebSocket.Server({ server });
 
-function send(ws,msg){if(ws.readyState===WebSocket.OPEN)ws.send(JSON.stringify(msg));}
-function others(room,except){return [...(rooms.get(room)||[])].filter(x=>x!==except);}
+const rooms = new Map();
 
-wss.on("connection",ws=>{
-  ws.id=Math.random().toString(36).slice(2)+Date.now().toString(36);
-  ws.room=null;ws.name="Guest";
+function send(ws, data) {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(data));
+  }
+}
 
-  ws.on("message",raw=>{
-    let m;try{m=JSON.parse(raw)}catch{return}
+function broadcast(room, data, except = null) {
+  for (const client of room) {
+    if (client !== except) {
+      send(client, data);
+    }
+  }
+}
 
-    if(m.type==="join"){
-      const room=String(m.room||"").replace(/[^a-zA-Z0-9_-]/g,"").slice(0,80);
-      if(!room)return;
-      ws.room=room;ws.name=String(m.name||"Guest").slice(0,40);
-      if(!rooms.has(room))rooms.set(room,new Set());
+wss.on("connection", ws => {
+  ws.room = null;
+  ws.id = Math.random().toString(36).slice(2);
 
-      send(ws,{type:"joined",selfId:ws.id,
-        peers:others(room,ws).map(p=>({id:p.id,name:p.name}))});
+  send(ws, {
+    type: "connected",
+    id: ws.id
+  });
 
-      rooms.get(room).add(ws);
-      others(room,ws).forEach(p=>send(p,{type:"peer-joined",peer:{id:ws.id,name:ws.name}}));
+  ws.on("message", raw => {
+    let msg;
+
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch {
+      return;
     }
 
-    if(m.type==="signal"&&ws.room){
-      const target=others(ws.room,ws).find(p=>p.id===m.to);
-      if(target)send(target,{type:"signal",from:ws.id,name:ws.name,data:m.data});
+    if (msg.type === "join") {
+      const roomId = String(msg.room || "").trim();
+
+      if (!roomId) return;
+
+      if (!rooms.has(roomId)) {
+        rooms.set(roomId, new Set());
+      }
+
+      const room = rooms.get(roomId);
+
+      ws.room = roomId;
+
+      const existingUsers = [];
+
+      for (const client of room) {
+        existingUsers.push(client.id);
+      }
+
+      room.add(ws);
+
+      send(ws, {
+        type: "room-users",
+        users: existingUsers
+      });
+
+      broadcast(
+        room,
+        {
+          type: "user-joined",
+          id: ws.id
+        },
+        ws
+      );
+
+      return;
     }
 
-    if(m.type==="chat"&&ws.room){
-      others(ws.room,null).forEach(p=>send(p,{
-        type:"chat",from:ws.id,name:ws.name,
-        text:String(m.text||"").slice(0,1000)
-      }));
+    if (!ws.room) return;
+
+    const room = rooms.get(ws.room);
+
+    if (!room) return;
+
+    if (
+      msg.type === "offer" ||
+      msg.type === "answer" ||
+      msg.type === "ice"
+    ) {
+      const target = [...room].find(client => client.id === msg.to);
+
+      if (target) {
+        send(target, {
+          ...msg,
+          from: ws.id
+        });
+      }
+
+      return;
+    }
+
+    if (msg.type === "chat") {
+      broadcast(room, {
+        type: "chat",
+        from: ws.id,
+        message: String(msg.message || "").slice(0, 2000),
+        time: Date.now()
+      });
+
+      return;
     }
   });
 
-  const leave=()=>{
-    if(!ws.room)return;
-    const set=rooms.get(ws.room);
-    if(set){
-      set.delete(ws);
-      set.forEach(p=>send(p,{type:"peer-left",id:ws.id}));
-      if(!set.size)rooms.delete(ws.room);
+  ws.on("close", () => {
+    if (!ws.room) return;
+
+    const room = rooms.get(ws.room);
+
+    if (!room) return;
+
+    room.delete(ws);
+
+    broadcast(room, {
+      type: "user-left",
+      id: ws.id
+    });
+
+    if (room.size === 0) {
+      rooms.delete(ws.room);
     }
-    ws.room=null;
-  };
-  ws.on("close",leave);
-  ws.on("error",leave);
+  });
+
+  ws.on("error", () => {});
 });
 
-server.listen(PORT,()=>console.log("Meetsy running on port "+PORT));
+setInterval(() => {
+  for (const ws of wss.clients) {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.ping();
+    }
+  }
+}, 25000);
+
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`Meetsy running on port ${PORT}`);
+});
